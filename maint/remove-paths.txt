@@ -1,0 +1,6 @@
+# src/ 下的资源由打包器按引用决定去留，只需处理会被整目录复制的 public/。
+public/pwa-192x192.png
+public/pwa-512x512.png
+public/pwa-maskable-192x192.png
+public/pwa-maskable-512x512.png
+public/THIRD_PARTY_NOTICES.md
