@@ -1,3 +1,4 @@
+import { realpathSync } from 'node:fs'
 import { fileURLToPath, URL } from 'node:url'
 import { defineConfig, type Plugin, type UserConfig } from 'vite'
 import upstream from '../vite.config'
@@ -5,12 +6,20 @@ import upstream from '../vite.config'
 const here = (p: string) => fileURLToPath(new URL(p, import.meta.url))
 
 // EarthGlobeCard 是 defineAsyncComponent 动态引入，替换它即可摘掉整棵 three.js 依赖树。
+// vuedraggable 只有 UMD 构建，require('vue') 会拉入带编译器的 CJS 完整版和第二份运行时；
+// 指向 ESM 运行时（取真实路径，与应用自身的 vue 解析为同一模块）。
+// tldts 仅用于连接历史的主域名归并，以轻量近似实现替换完整公共后缀表。
 const REDIRECTS: Array<[string, string]> = [
   ['src/assets/load-fonts.ts', here('./stubs/load-fonts.ts')],
   ['src/components/overview/EarthGlobeCard.vue', here('./stubs/EarthGlobeCard.vue')],
   ['src/i18n/en.ts', here('../src/i18n/zh.ts')],
   ['src/i18n/ru.ts', here('../src/i18n/zh.ts')],
   ['src/i18n/zh-tw.ts', here('../src/i18n/zh.ts')],
+  [
+    'node_modules/vue/index.js',
+    realpathSync(here('../node_modules/vue/dist/vue.runtime.esm-bundler.js')),
+  ],
+  ['tldts', here('./stubs/tldts.ts')],
 ]
 
 function slimResolve(): Plugin {
@@ -26,7 +35,7 @@ function slimResolve(): Plugin {
       const id = resolved.id.split('?')[0].replace(/\\/g, '/')
 
       for (const [suffix, target] of REDIRECTS) {
-        if (id.endsWith(suffix)) {
+        if (source === suffix || id.endsWith(suffix)) {
           hit.add(suffix)
           return target
         }

@@ -4,150 +4,154 @@ on:
   workflow_dispatch:
     inputs:
       upstream_commit:
-        description: 'Upstream Commit SHA'
+        description: 'Upstream commit SHA (40 chars); empty = latest upstream release'
         required: false
         type: string
 
-permissions:
-  contents: write
-  actions: write
+permissions: {}
 
 concurrency:
-  group: zashboard-build
+  group: slim-release
   cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
 
 env:
   UPSTREAM_REPO: Zephyruso/zashboard
 
 jobs:
-  build-slim-release:
+  build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      sha: ${{ steps.meta.outputs.sha }}
     steps:
-      - name: Checkout maint repository
-        uses: actions/checkout@v7
+      - name: Resolve upstream ref
+        id: ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_COMMIT: ${{ inputs.upstream_commit }}
+        run: |
+          if [ -z "$INPUT_COMMIT" ]; then
+            ref=$(gh api "repos/$UPSTREAM_REPO/releases/latest" --jq .tag_name)
+          elif [[ "$INPUT_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            ref=$INPUT_COMMIT
+          else
+            echo "::error::upstream_commit must be a full 40-char SHA"; exit 1
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v6
+      - uses: actions/checkout@v7
         with:
-          version: 11
+          path: self
+          persist-credentials: false
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ steps.ref.outputs.ref }}
+          path: upstream
+          persist-credentials: false
+
+      - name: Read upstream metadata
+        id: meta
+        working-directory: upstream
+        env:
+          REF: ${{ steps.ref.outputs.ref }}
+          INPUT_COMMIT: ${{ inputs.upstream_commit }}
+        run: |
+          tag="v$(jq -r .version package.json)"
+          if [ -z "$INPUT_COMMIT" ] && [ "$tag" != "$REF" ]; then
+            echo "::error::version mismatch: package.json=$tag release=$REF"; exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: upstream/package.json
+
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
+          cache: pnpm
+          cache-dependency-path: upstream/pnpm-lock.yaml
 
-      - name: Clone upstream and apply slim rules
-        id: meta
-        env:
-          GH_TOKEN: ${{ github.token }}
-          UPSTREAM_COMMIT: ${{ inputs.upstream_commit }}
-          UPDATE_REPO: vitoegg/Zashboard
-        run: |
-          set -eu
-          if [ -z "$UPSTREAM_COMMIT" ]; then
-            tag=$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq '.tag_name')
-            case "$tag" in
-              v*) ;;
-              *) echo "unexpected upstream tag: $tag" >&2; exit 1 ;;
-            esac
-            ref="refs/tags/${tag}"
-          elif [[ "$UPSTREAM_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]]; then
-            ref=$UPSTREAM_COMMIT
-          else
-            echo 'Upstream Commit SHA must be a full 40-character SHA; leave empty for the latest upstream release.' >&2
-            exit 1
-          fi
-
-          git init "$RUNNER_TEMP/zashboard"
-          git -C "$RUNNER_TEMP/zashboard" remote add origin "https://github.com/${UPSTREAM_REPO}.git"
-          git -C "$RUNNER_TEMP/zashboard" fetch --depth 1 origin "$ref"
-          git -C "$RUNNER_TEMP/zashboard" checkout --detach FETCH_HEAD
-          commit=$(git -C "$RUNNER_TEMP/zashboard" rev-parse HEAD)
-          pkg_ver=$(node -p "require(process.env.RUNNER_TEMP + '/zashboard/package.json').version")
-          if [ -z "$UPSTREAM_COMMIT" ] && [ "$pkg_ver" != "${tag#v}" ]; then
-            echo "version mismatch: package.json=${pkg_ver} release=${tag#v}" >&2
-            exit 1
-          fi
-          echo "upstream_tag=v${pkg_ver}" >> "$GITHUB_OUTPUT"
-          echo "upstream_commit=${commit}" >> "$GITHUB_OUTPUT"
-          echo "Upstream commit: ${commit}"
-
-          sh maint/apply.sh "$RUNNER_TEMP/zashboard"
-
-      - name: Install, build and package dist.zip
-        working-directory: ${{ runner.temp }}/zashboard
+      - name: Build dist.zip
+        working-directory: upstream
         env:
           HUSKY: '0'
+          UPDATE_REPO: ${{ github.repository }}
         run: |
-          set -eu
           pnpm install --frozen-lockfile
+          sh ../self/maint/apply.sh .
           pnpm type-check
           pnpm exec vite build --config slim/vite.config.ts
-          zip -9 -r "$GITHUB_WORKSPACE/dist.zip" dist
-          size=$(wc -c < "$GITHUB_WORKSPACE/dist.zip" | tr -d ' ')
-          echo "dist.zip bytes=${size}"
+          test -s dist/index.html
+          zip -qr9 ../dist.zip dist
+          size=$(stat -c %s ../dist.zip)
+          echo "dist.zip: $size bytes"
           test "$size" -lt 1048576
 
-      - name: Publish dist.zip to GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.meta.outputs.upstream_tag }}
-          COMMIT: ${{ steps.meta.outputs.upstream_commit }}
+      - uses: actions/upload-artifact@v7
+        with:
+          path: dist.zip
+          archive: false
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.build.outputs.tag }}
+      UPSTREAM_SHA: ${{ needs.build.outputs.sha }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist.zip
+          skip-decompress: true
+
+      - name: Publish release
         run: |
-          set -eu
-          TITLE="${TAG}"
-          NOTES=$(printf '%s\n\n%s\n%s' \
-            '🪶 Slim build of Zephyruso/zashboard' \
-            "- 🔖 Version: \`${TAG}\`" \
-            "- 🔗 Commit: [\`${COMMIT:0:7}\`](https://github.com/${UPSTREAM_REPO}/commit/${COMMIT})")
+          cat > notes.md <<EOF
+          🪶 Slim build of $UPSTREAM_REPO
+
+          - 🔖 Version: \`$TAG\`
+          - 🔗 Upstream: [\`${UPSTREAM_SHA::7}\`](https://github.com/$UPSTREAM_REPO/commit/$UPSTREAM_SHA)
+          - 🛠️ Build: [\`${GITHUB_SHA::7}\`](https://github.com/$GH_REPO/commit/$GITHUB_SHA)
+          EOF
 
           if gh release view "$TAG" >/dev/null 2>&1; then
+            # Move the existing tag first so a rejection leaves the release untouched.
+            gh api --method PATCH "repos/$GH_REPO/git/refs/tags/$TAG" \
+              -f sha="$GITHUB_SHA" -F force=true --silent
             gh release upload "$TAG" dist.zip --clobber
-            gh release edit "$TAG" --title "$TITLE" --notes "$NOTES"
+            gh release edit "$TAG" --notes-file notes.md --latest
           else
-            gh release create "$TAG" dist.zip --title "$TITLE" --notes "$NOTES"
+            gh release create "$TAG" dist.zip --target "$GITHUB_SHA" \
+              --title "$TAG" --notes-file notes.md --latest
           fi
 
-      - name: Retain only current Release and tag
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.meta.outputs.upstream_tag }}
+      - name: Delete other releases
         run: |
-          set -euo pipefail
-          asset_count=$(gh release view "$TAG" --json assets \
-            --jq '[.assets[] | select(.name == "dist.zip")] | length')
-          test "$asset_count" -eq 1
+          gh release list --limit 100 --json tagName \
+            --jq ".[].tagName | select(. != \"$TAG\")" |
+            xargs -r -n1 gh release delete --cleanup-tag --yes
 
-          gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" \
-            --jq '.[] | [.id, .tag_name] | @tsv' |
-          while IFS=$'\t' read -r id tag; do
-            [ "$tag" = "$TAG" ] || \
-              gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/${id}"
-          done
-
-          gh api --paginate "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags" \
-            --jq '.[].ref' |
-          while IFS= read -r ref; do
-            [ "$ref" = "refs/tags/${TAG}" ] || \
-              gh api --method DELETE \
-                "repos/${GITHUB_REPOSITORY}/git/refs/${ref#refs/}"
-          done
-
-          release_tags=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" \
-            --jq '.[].tag_name')
-          git_tags=$(gh api --paginate \
-            "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags" --jq '.[].ref')
-          test "$release_tags" = "$TAG"
-          test "$git_tags" = "refs/tags/${TAG}"
-
-      - name: Purge workflow run history
-        if: success()
-        uses: ophub/delete-releases-workflows@main
-        with:
-          gh_token: ${{ secrets.GITHUB_TOKEN }}
-          out_log: false
-          delete_releases: false
-          delete_tags: false
-          delete_workflows: true
-          workflows_keep_day: 0
+      - name: Delete previous workflow runs
+        run: |
+          gh run list --status completed --limit 100 --json databaseId \
+            --jq '.[].databaseId' |
+            xargs -r -n1 gh run delete
